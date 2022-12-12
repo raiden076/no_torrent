@@ -4,10 +4,8 @@ from time import sleep
 from os import path as ospath, remove as osremove, listdir, walk
 from subprocess import Popen
 from html import escape
-from telegram import InlineKeyboardMarkup
 
-from bot import Interval, INDEX_URL, VIEW_LINK, aria2, DOWNLOAD_DIR, download_dict, download_dict_lock, \
-                LEECH_SPLIT_SIZE, LOGGER, DB_URI, INCOMPLETE_TASK_NOTIFIER, MAX_SPLIT_SIZE
+from bot import Interval, aria2, DOWNLOAD_DIR, download_dict, download_dict_lock, LOGGER, DATABASE_URL, MAX_SPLIT_SIZE, config_dict, status_reply_dict_lock
 from bot.helper.ext_utils.fs_utils import get_base_name, get_path_size, split_file, clean_download, clean_target
 from bot.helper.ext_utils.exceptions import NotSupportedExtractionArchive
 from bot.helper.mirror_utils.status_utils.extract_status import ExtractStatus
@@ -42,15 +40,16 @@ class MirrorLeechListener:
 
     def clean(self):
         try:
-            Interval[0].cancel()
-            Interval.clear()
+            with status_reply_dict_lock:
+                Interval[0].cancel()
+                Interval.clear()
             aria2.purge()
             delete_all_messages()
         except:
             pass
 
     def onDownloadStart(self):
-        if not self.isPrivate and INCOMPLETE_TASK_NOTIFIER and DB_URI is not None:
+        if not self.isPrivate and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             DbManger().add_incomplete_task(self.message.chat.id, self.message.link, self.tag)
 
     def onDownloadComplete(self):
@@ -60,7 +59,7 @@ class MirrorLeechListener:
             gid = download.gid()
         LOGGER.info(f"Download completed: {name}")
         if name == "None" or self.isQbit or not ospath.exists(f"{self.dir}/{name}"):
-            name = listdir(f"{self.dir}")[-1]
+            name = listdir(self.dir)[-1]
         m_path = f'{self.dir}/{name}'
         size = get_path_size(m_path)
         if self.isZip:
@@ -71,6 +70,7 @@ class MirrorLeechListener:
                 path = f"{m_path}.zip"
             with download_dict_lock:
                 download_dict[self.uid] = ZipStatus(name, size, gid, self)
+            LEECH_SPLIT_SIZE = config_dict['LEECH_SPLIT_SIZE']
             if self.pswd is not None:
                 if self.isLeech and int(size) > LEECH_SPLIT_SIZE:
                     LOGGER.info(f'Zip: orig_path: {m_path}, zip_path: {path}.0*')
@@ -100,18 +100,20 @@ class MirrorLeechListener:
                     if self.seed:
                         self.newDir = f"{self.dir}10000"
                         path = f"{self.newDir}/{name}"
+                    else:
+                        path = m_path
                     for dirpath, subdir, files in walk(m_path, topdown=False):
                         for file_ in files:
                             if re_search(r'\.part0*1\.rar$|\.7z\.0*1$|\.zip\.0*1$|\.zip$|\.7z$|^.(?!.*\.part\d+\.rar)(?=.*\.rar$)', file_):
-                                m_path = ospath.join(dirpath, file_)
+                                f_path = ospath.join(dirpath, file_)
                                 if self.seed:
                                     t_path = dirpath.replace(self.dir, self.newDir)
                                 else:
                                     t_path = dirpath
                                 if self.pswd is not None:
-                                    self.suproc = Popen(["7z", "x", f"-p{self.pswd}", m_path, f"-o{t_path}", "-aot"])
+                                    self.suproc = Popen(["7z", "x", f"-p{self.pswd}", f_path, f"-o{t_path}", "-aot"])
                                 else:
-                                    self.suproc = Popen(["7z", "x", m_path, f"-o{t_path}", "-aot"])
+                                    self.suproc = Popen(["7z", "x", f_path, f"-o{t_path}", "-aot"])
                                 self.suproc.wait()
                                 if self.suproc.returncode == -9:
                                     return
@@ -160,6 +162,7 @@ class MirrorLeechListener:
             o_files = []
             if not self.isZip:
                 checked = False
+                LEECH_SPLIT_SIZE = config_dict['LEECH_SPLIT_SIZE']
                 for dirpath, subdir, files in walk(up_dir, topdown=False):
                     for file_ in files:
                         f_path = ospath.join(dirpath, file_)
@@ -176,17 +179,16 @@ class MirrorLeechListener:
                             if res == "errored":
                                 if f_size <= MAX_SPLIT_SIZE:
                                     continue
-                                else:
-                                    try:
-                                        osremove(f_path)
-                                    except:
-                                        return
+                                try:
+                                    osremove(f_path)
+                                except:
+                                    return
                             elif not self.seed or self.newDir:
                                 try:
                                     osremove(f_path)
                                 except:
                                     return
-                            elif self.seed and res != "errored":
+                            else:
                                 m_size.append(f_size)
                                 o_files.append(file_)
 
@@ -212,7 +214,7 @@ class MirrorLeechListener:
             drive.upload(up_name)
 
     def onUploadComplete(self, link: str, size, files, folders, typ, name):
-        if not self.isPrivate and INCOMPLETE_TASK_NOTIFIER and DB_URI is not None:
+        if not self.isPrivate and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             DbManger().rm_complete_task(self.message.link)
         msg = f"<b>Name: </b><code>{escape(name)}</code>\n\n<b>Size: </b>{size}"
         if self.isLeech:
@@ -245,7 +247,7 @@ class MirrorLeechListener:
             buttons = ButtonMaker()
             buttons.buildbutton("☁️ Drive Link", link)
             LOGGER.info(f'Done Uploading {name}')
-            if INDEX_URL is not None:
+            if INDEX_URL:= config_dict['INDEX_URL']:
                 url_path = rutils.quote(f'{name}')
                 share_url = f'{INDEX_URL}/{url_path}'
                 if typ == "Folder":
@@ -253,10 +255,10 @@ class MirrorLeechListener:
                     buttons.buildbutton("⚡ Index Link", share_url)
                 else:
                     buttons.buildbutton("⚡ Index Link", share_url)
-                    if VIEW_LINK:
+                    if config_dict['VIEW_LINK']:
                         share_urls = f'{INDEX_URL}/{url_path}?a=view'
                         buttons.buildbutton("🌐 View Link", share_urls)
-            sendMarkup(msg, self.bot, self.message, InlineKeyboardMarkup(buttons.build_menu(2)))
+            sendMarkup(msg, self.bot, self.message, buttons.build_menu(2))
             if self.seed:
                 if self.isZip:
                     clean_target(f"{self.dir}/{name}")
@@ -293,7 +295,7 @@ class MirrorLeechListener:
         else:
             update_all_messages()
 
-        if not self.isPrivate and INCOMPLETE_TASK_NOTIFIER and DB_URI is not None:
+        if not self.isPrivate and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             DbManger().rm_complete_task(self.message.link)
 
     def onUploadError(self, error):
@@ -313,5 +315,5 @@ class MirrorLeechListener:
         else:
             update_all_messages()
 
-        if not self.isPrivate and INCOMPLETE_TASK_NOTIFIER and DB_URI is not None:
+        if not self.isPrivate and config_dict['INCOMPLETE_TASK_NOTIFIER'] and DATABASE_URL:
             DbManger().rm_complete_task(self.message.link)

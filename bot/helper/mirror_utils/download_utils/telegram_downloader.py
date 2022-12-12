@@ -2,9 +2,9 @@ from logging import getLogger, WARNING
 from time import time
 from threading import RLock, Lock
 
-from bot import LOGGER, download_dict, download_dict_lock, STOP_DUPLICATE, app
+from bot import LOGGER, download_dict, download_dict_lock, app, config_dict
 from ..status_utils.telegram_download_status import TelegramDownloadStatus
-from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendFile
+from bot.helper.telegram_helper.message_utils import sendStatusMessage, sendMarkup
 from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
 
 global_lock = Lock()
@@ -69,6 +69,9 @@ class TelegramDownloadHelper:
     def __download(self, message, path):
         try:
             download = message.download(file_name=path, progress=self.__onDownloadProgress)
+            if self.__is_cancelled:
+                self.__onDownloadError('Cancelled by user!')
+                return
         except Exception as e:
             LOGGER.error(str(e))
             return self.__onDownloadError(str(e))
@@ -79,7 +82,7 @@ class TelegramDownloadHelper:
 
     def add_download(self, message, path, filename):
         _dmsg = app.get_messages(message.chat.id, reply_to_message_ids=message.message_id)
-        media = next((i for i in [_dmsg.document, _dmsg.video, _dmsg.audio] if i is not None), None)
+        media = _dmsg.document or _dmsg.video or _dmsg.audio or None
         if media is not None:
             with global_lock:
                 # For avoiding locking the thread lock for long time unnecessarily
@@ -92,13 +95,12 @@ class TelegramDownloadHelper:
 
             if download:
                 size = media.file_size
-                if STOP_DUPLICATE and not self.__listener.isLeech:
+                if config_dict['STOP_DUPLICATE'] and not self.__listener.isLeech:
                     LOGGER.info('Checking File/Folder if already in Drive...')
-                    cap, f_name = GoogleDriveHelper().drive_list(name, True, True)
-                    if cap:
-                        cap = f"File/Folder is already available in Drive. Here are the search results:\n\n{cap}"
-                        sendFile(self.__listener.bot, self.__listener.message, f_name, cap)
-                        return
+                    smsg, button = GoogleDriveHelper().drive_list(name, True, True)
+                    if smsg:
+                        msg = "File/Folder is already available in Drive.\nHere are the search results:"
+                        return sendMarkup(msg, self.__listener.bot, self.__listener.message, button)
                 self.__onDownloadStart(name, size, media.file_unique_id)
                 LOGGER.info(f'Downloading Telegram file with id: {media.file_unique_id}')
                 self.__download(_dmsg, path)
@@ -110,4 +112,3 @@ class TelegramDownloadHelper:
     def cancel_download(self):
         LOGGER.info(f'Cancelling download on user request: {self.__id}')
         self.__is_cancelled = True
-        self.__onDownloadError('Cancelled by user!')

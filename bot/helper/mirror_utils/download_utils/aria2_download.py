@@ -1,11 +1,11 @@
 from time import sleep, time
-from os import remove
+from os import remove, path as ospath
 
-from bot import aria2, download_dict_lock, download_dict, STOP_DUPLICATE, BASE_URL, LOGGER
+from bot import aria2, download_dict_lock, download_dict, LOGGER, config_dict, aria2_options, aria2c_global
 from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
 from bot.helper.ext_utils.bot_utils import is_magnet, getDownloadByGid, new_thread, bt_selection_buttons
 from bot.helper.mirror_utils.status_utils.aria_download_status import AriaDownloadStatus
-from bot.helper.telegram_helper.message_utils import sendMarkup, sendStatusMessage, sendMessage, deleteMessage, update_all_messages, sendFile
+from bot.helper.telegram_helper.message_utils import sendMarkup, sendStatusMessage, sendMessage, deleteMessage, update_all_messages
 from bot.helper.ext_utils.fs_utils import get_base_name, clean_unwanted
 
 
@@ -29,7 +29,7 @@ def __onDownloadStarted(api, gid):
     else:
         LOGGER.info(f'onDownloadStarted: {download.name} - Gid: {gid}')
     try:
-        if STOP_DUPLICATE:
+        if config_dict['STOP_DUPLICATE']:
             sleep(1)
             if dl := getDownloadByGid(gid):
                 listener = dl.listener()
@@ -49,13 +49,11 @@ def __onDownloadStarted(api, gid):
                     except:
                         sname = None
                 if sname is not None:
-                    cap, f_name = GoogleDriveHelper().drive_list(sname, True)
-                    if cap:
-                        listener.onDownloadError('File/Folder already available in Drive.')
+                    smsg, button = GoogleDriveHelper().drive_list(sname, True)
+                    if smsg:
+                        listener.onDownloadError('File/Folder already available in Drive.\n\n')
                         api.remove([download], force=True, files=True)
-                        cap = f"Here are the search results:\n\n{cap}"
-                        sendFile(listener.bot, listener.message, f_name, cap)
-                        return
+                        return sendMarkup("Here are the search results:", listener.bot, listener.message, button)
     except Exception as e:
         LOGGER.error(f"{e} onDownloadStart: {gid} check duplicate didn't pass")
 
@@ -70,19 +68,17 @@ def __onDownloadComplete(api, gid):
         LOGGER.info(f'Gid changed from {gid} to {new_gid}')
         if dl := getDownloadByGid(new_gid):
             listener = dl.listener()
-            if BASE_URL is not None and listener.select:
+            if config_dict['BASE_URL'] and listener.select:
                 api.client.force_pause(new_gid)
                 SBUTTONS = bt_selection_buttons(new_gid)
                 msg = "Your download paused. Choose files then press Done Selecting button to start downloading."
                 sendMarkup(msg, listener.bot, listener.message, SBUTTONS)
     elif download.is_torrent:
         if dl := getDownloadByGid(gid):
-            if hasattr(dl, 'listener'):
-                listener = dl.listener()
-                if hasattr(listener, 'uploaded'):
-                    LOGGER.info(f"Cancelling Seed: {download.name} onDownloadComplete")
-                    listener.onUploadError(f"Seeding stopped with Ratio: {dl.ratio()} and Time: {dl.seeding_time()}")
-                    api.remove([download], force=True, files=True)
+            if hasattr(dl, 'listener') and dl.seeding:
+                LOGGER.info(f"Cancelling Seed: {download.name} onDownloadComplete")
+                dl.listener().onUploadError(f"Seeding stopped with Ratio: {dl.ratio()} and Time: {dl.seeding_time()}")
+                api.remove([download], force=True, files=True)
     else:
         LOGGER.info(f"onDownloadComplete: {download.name} - Gid: {gid}")
         if dl := getDownloadByGid(gid):
@@ -100,9 +96,10 @@ def __onBtDownloadComplete(api, gid):
         if listener.select:
             res = download.files
             for file_o in res:
-                if not file_o.selected:
+                f_path = file_o.path
+                if not file_o.selected and ospath.exists(f_path):
                     try:
-                        remove(file_o.path)
+                        remove(f_path)
                     except:
                         pass
             clean_unwanted(download.dir)
@@ -110,26 +107,28 @@ def __onBtDownloadComplete(api, gid):
             try:
                 api.set_options({'max-upload-limit': '0'}, [download])
             except Exception as e:
-                LOGGER.error(f'{e} You are not able to seed because you added global option seed-time=0 without adding specific seed_time for this torrent')
+                LOGGER.error(f'{e} You are not able to seed because you added global option seed-time=0 without adding specific seed_time for this torrent GID: {gid}')
         else:
-            api.client.force_pause(gid)
+            try:
+                api.client.force_pause(gid)
+            except Exception as e:
+                LOGGER.error(f"{e} GID: {gid}" )
         listener.onDownloadComplete()
+        download = download.live
         if listener.seed:
-            with download_dict_lock:
-                if listener.uid not in download_dict:
-                    api.remove([download], force=True, files=True)
-                    return
-                download_dict[listener.uid] = AriaDownloadStatus(gid, listener)
-                download_dict[listener.uid].start_time = seed_start_time
-            LOGGER.info(f"Seeding started: {download.name} - Gid: {gid}")
-            download = download.live
             if download.is_complete:
                 if dl := getDownloadByGid(gid):
                     LOGGER.info(f"Cancelling Seed: {download.name}")
                     listener.onUploadError(f"Seeding stopped with Ratio: {dl.ratio()} and Time: {dl.seeding_time()}")
                     api.remove([download], force=True, files=True)
             else:
-                listener.uploaded = True
+                with download_dict_lock:
+                    if listener.uid not in download_dict:
+                        api.remove([download], force=True, files=True)
+                        return
+                    download_dict[listener.uid] = AriaDownloadStatus(gid, listener, True)
+                    download_dict[listener.uid].start_time = seed_start_time
+                LOGGER.info(f"Seeding started: {download.name} - Gid: {gid}")
                 update_all_messages()
         else:
             api.remove([download], force=True, files=True)
@@ -162,8 +161,11 @@ def start_listener():
                                   on_bt_download_complete=__onBtDownloadComplete,
                                   timeout=60)
 
-def add_aria2c_download(link: str, path, listener, filename, auth, select, ratio, seed_time):
-    args = {'dir': path, 'max-upload-limit': '1K'}
+def add_aria2c_download(link: str, path, listener, filename, auth, ratio, seed_time):
+    args = {'dir': path, 'max-upload-limit': '1K', 'netrc-path': '/usr/src/app/.netrc'}
+    a2c_opt = {**aria2_options}
+    [a2c_opt.pop(k) for k in aria2c_global if k in aria2_options]
+    args.update(a2c_opt)
     if filename:
         args['out'] = filename
     if auth:
@@ -172,6 +174,8 @@ def add_aria2c_download(link: str, path, listener, filename, auth, select, ratio
         args['seed-ratio'] = ratio
     if seed_time:
         args['seed-time'] = seed_time
+    if TORRENT_TIMEOUT := config_dict['TORRENT_TIMEOUT']:
+        args['bt-stop-timeout'] = str(TORRENT_TIMEOUT)
     if is_magnet(link):
         download = aria2.add_magnet(link, args)
     else:
@@ -184,7 +188,7 @@ def add_aria2c_download(link: str, path, listener, filename, auth, select, ratio
         download_dict[listener.uid] = AriaDownloadStatus(download.gid, listener)
         LOGGER.info(f"Aria2Download started: {download.gid}")
     listener.onDownloadStart()
-    if not select:
+    if not listener.select:
         sendStatusMessage(listener.message, listener.bot)
 
 start_listener()

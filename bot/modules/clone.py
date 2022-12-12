@@ -5,18 +5,19 @@ from threading import Thread
 from time import sleep
 
 from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
-from bot.helper.telegram_helper.message_utils import sendMessage, deleteMessage, delete_all_messages, update_all_messages, sendStatusMessage, sendFile, sendMarkup
+from bot.helper.telegram_helper.message_utils import sendMessage, deleteMessage, delete_all_messages, update_all_messages, sendStatusMessage, sendMarkup
 from bot.helper.telegram_helper.filters import CustomFilters
 from bot.helper.telegram_helper.bot_commands import BotCommands
 from bot.helper.mirror_utils.status_utils.clone_status import CloneStatus
-from bot import dispatcher, LOGGER, STOP_DUPLICATE, download_dict, download_dict_lock, Interval
+from bot import dispatcher, LOGGER, download_dict, download_dict_lock, Interval, config_dict
 from bot.helper.ext_utils.bot_utils import is_gdrive_link, new_thread
 
 
-def _clone(message, bot, multi=0):
+def _clone(message, bot):
     args = message.text.split()
     reply_to = message.reply_to_message
     link = ''
+    multi = 0
     if len(args) > 1:
         link = args[1].strip()
         if link.strip().isdigit():
@@ -38,21 +39,21 @@ def _clone(message, bot, multi=0):
         res, size, name, files = gd.helper(link)
         if res != "":
             return sendMessage(res, bot, message)
-        if STOP_DUPLICATE:
+        if config_dict['STOP_DUPLICATE']:
             LOGGER.info('Checking File/Folder if already in Drive...')
-            cap, f_name = gd.drive_list(name, True, True)
-            if cap:
-                cap = f"File/Folder is already available in Drive. Here are the search results:\n\n{cap}"
-                sendFile(bot, message, f_name, cap)
-                return
+            smsg, button = gd.drive_list(name, True, True)
+            if smsg:
+                msg = "File/Folder is already available in Drive.\nHere are the search results:"
+                return sendMarkup(msg, bot, message, button)
         if multi > 1:
             sleep(4)
             nextmsg = type('nextmsg', (object, ), {'chat_id': message.chat_id, 'message_id': message.reply_to_message.message_id + 1})
-            nextmsg = sendMessage(args[0], bot, nextmsg)
+            cmsg = message.text.split()
+            cmsg[1] = f"{multi - 1}"
+            nextmsg = sendMessage(" ".join(cmsg), bot, nextmsg)
             nextmsg.from_user.id = message.from_user.id
-            multi -= 1
             sleep(4)
-            Thread(target=_clone, args=(nextmsg, bot, multi)).start()
+            Thread(target=_clone, args=(nextmsg, bot)).start()
         if files <= 20:
             msg = sendMessage(f"Cloning: <code>{link}</code>", bot, message)
             result, button = gd.clone(link)
@@ -90,5 +91,7 @@ def _clone(message, bot, multi=0):
 def cloneNode(update, context):
     _clone(update.message, context.bot)
 
-clone_handler = CommandHandler(BotCommands.CloneCommand, cloneNode, filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
+clone_handler = CommandHandler(BotCommands.CloneCommand, cloneNode,
+                               filters=CustomFilters.authorized_chat | CustomFilters.authorized_user, run_async=True)
+
 dispatcher.add_handler(clone_handler)

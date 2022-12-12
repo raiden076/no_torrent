@@ -1,7 +1,7 @@
 from telegram.ext import CommandHandler, CallbackQueryHandler
 from os import remove, path as ospath
 
-from bot import aria2, BASE_URL, download_dict, dispatcher, download_dict_lock, SUDO_USERS, OWNER_ID
+from bot import aria2, download_dict, dispatcher, download_dict_lock, OWNER_ID, user_data, LOGGER
 from bot.helper.telegram_helper.bot_commands import BotCommands
 from bot.helper.telegram_helper.filters import CustomFilters
 from bot.helper.telegram_helper.message_utils import sendMessage, sendMarkup, sendStatusMessage
@@ -32,25 +32,30 @@ def select(update, context):
         sendMessage(msg, context.bot, update.message)
         return
 
-    if OWNER_ID != user_id and dl.message.from_user.id != user_id and user_id not in SUDO_USERS:
+    if OWNER_ID != user_id and dl.message.from_user.id != user_id and \
+       (user_id not in user_data or not user_data[user_id].get('is_sudo')):
         sendMessage("This task is not for you!", context.bot, update.message)
         return
     if dl.status() not in [MirrorStatus.STATUS_DOWNLOADING, MirrorStatus.STATUS_PAUSED, MirrorStatus.STATUS_WAITING]:
-        sendMessage('Task should be in downloading status or in pause status incase message deleted by wrong or in queued status incase you used torrent file!', context.bot, update.message)
+        sendMessage('Task should be in download or pause (incase message deleted by wrong) or queued (status incase you used torrent file)!', context.bot, update.message)
         return
     if dl.name().startswith('[METADATA]'):
         sendMessage('Try after downloading metadata finished!', context.bot, update.message)
         return
 
     try:
-        if dl.listener().isQbit:
-            id_ = dl.download().ext_hash
+        listener = dl.listener()
+        if listener.isQbit:
+            id_ = dl.hash()
             client = dl.client()
             client.torrents_pause(torrent_hashes=id_)
-            dl.download().select = True
         else:
             id_ = dl.gid()
-            aria2.client.force_pause(id_)
+            try:
+                aria2.client.force_pause(id_)
+            except Exception as e:
+                LOGGER.error(f"{e} Error in pause, this mostly happens after abuse aria2")
+        listener.select = True
     except:
         sendMessage("This is not a bittorrent task!", context.bot, update.message)
         return
@@ -69,7 +74,11 @@ def get_confirm(update, context):
         query.answer(text="This task has been cancelled!", show_alert=True)
         query.message.delete()
         return
-    listener = dl.listener()
+    if hasattr(dl, 'listener'):
+        listener = dl.listener()
+    else:
+        query.answer(text="Not in download state anymore! Keep this message to resume the seed if seed enabled!", show_alert=True)
+        return
     if user_id != listener.message.from_user.id:
         query.answer(text="This task is not for you!", show_alert=True)
     elif data[1] == "pin":
@@ -100,7 +109,10 @@ def get_confirm(update, context):
                         remove(f['path'])
                     except:
                         pass
-            aria2.client.unpause(id_)
+            try:
+                aria2.client.unpause(id_)
+            except Exception as e:
+                LOGGER.error(f"{e} Error in resume, this mostly happens after abuse aria2. Try to use select cmd again!")
         sendStatusMessage(listener.message, listener.bot)
         query.message.delete()
 
@@ -108,5 +120,6 @@ def get_confirm(update, context):
 select_handler = CommandHandler(BotCommands.BtSelectCommand, select,
                                 filters=(CustomFilters.authorized_chat | CustomFilters.authorized_user), run_async=True)
 bts_handler = CallbackQueryHandler(get_confirm, pattern="btsel", run_async=True)
+
 dispatcher.add_handler(select_handler)
 dispatcher.add_handler(bts_handler)
